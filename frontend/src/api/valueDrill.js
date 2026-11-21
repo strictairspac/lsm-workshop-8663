@@ -1,0 +1,1 @@
+import{api,post}from'./client.js';export const list=()=>api('/value-drills');export const create=data=>post('/value-drills',data);export const detail=id=>api('/value-drills/'+id);export const act=(id,data)=>post('/value-drills/'+id+'/actions',data);

@@ -1,6 +1,6 @@
 # 边缘遥测 LSM 合并工坊
 
-北岭边缘计算小组的有序键值写入与合并演练：记录写入批次、配置层级策略、后台执行刷盘与合并，用最后写入字典 Oracle 核查读结果，防止墓碑误删导致旧值复活。
+北岭边缘计算小组的有序键值写入与合并演练：记录写入批次、配置层级策略、后台执行刷盘与合并，用最后写入字典 Oracle 核查读结果，防止墓碑误删导致旧值复活；另有一个值空间回收演练，把大值移出键表、只留引用，并按“复制 → 切换 → 释放”安全回收。
 
 **这是 Python 确定性教学 LSM 模型。MySQL 8.0 仅保存业务元数据，不是对 MySQL/InnoDB 存储内核的实现或性能测试。** 页面与导出结果均保留此边界。
 
@@ -12,13 +12,14 @@
 - 层级配置：memtable 不同键容量、SSTable 合并触发数、层级上限、最终完整合并开关。
 - 合并队列：创建试验时持久化输入及配置快照，Redis 分发，独立 worker 执行并记录状态。
 - 读放大证据：显示合并前后层级、读写放大、真实存活键、Oracle 摘要、刷盘/合并轨迹、JSON 导出。
+- 值空间回收：超过阈值的值单独存入有上限的值空间，键表只留引用；可按批次开演练，写键、查范围、推进回收，核对读值与占用。
 - 管理员审计：记录写操作账号、路由与 HTTP 结果，包含权限拒绝。
 
 | 角色 | 页面与权限 | 典型动作 |
 |---|---|---|
-| admin 管理员 | 全业务页面与审计 | 登记批次/配置、执行、导出、查看审计 |
-| operator 操作员 | 四业务页面，不可看管理员审计 | 新建输入与配置、提交 worker、检查与下载结果 |
-| viewer 观察员 | 四业务页面只读与导出 | 阅读层级和 Oracle 证据，写请求在 API 层403 |
+| admin 管理员 | 全业务页面与审计 | 登记批次/配置、执行、导出、值空间演练、查看审计 |
+| operator 操作员 | 五业务页面，不可看管理员审计 | 新建输入与配置、提交 worker、检查与下载结果、值空间回收演练 |
+| viewer 观察员 | 五业务页面只读与导出 | 阅读层级、Oracle 与值空间证据，写请求在 API 层403 |
 
 ## 启动与账号
 
@@ -49,8 +50,9 @@ docker compose down -v --remove-orphans
 6. 09:25 打开读放大证据，确认早班输入最终6个存活键，sensor-02/03未复活。
 7. 09:30 下载 `lsm-trial-<id>.json`，包含操作/配置快照、层级、轨迹与校验和。
 8. 09:40 viewer复核，创建试验被403拒绝；10:00 admin检查操作审计。
+9. 09:50 operator 打开“值空间回收”，用“大值遥测-值空间演练”批次创建演练：开始范围读 → 覆盖同一键并推进回收（应先让行）→ 结束范围读 → 继续回收 → 核对占用与读值。
 
-Seed另含“旧值复活回归集”和“全部删除边界集”；配置另含“保留层级观测”和“宽缓冲-完整合并”。账户、批次、配置以自然键查缺插入，重复seed不改变已存在字段。
+Seed另含“旧值复活回归集”“全部删除边界集”与“大值遥测-值空间演练”；配置另含“保留层级观测”和“宽缓冲-完整合并”。账户、批次、配置以自然键查缺插入，重复seed不改变已存在字段。
 
 ## 核心算法与指标口径
 
@@ -67,6 +69,17 @@ Seed另含“旧值复活回归集”和“全部删除边界集”；配置另�
 
 输出包括真实计算的层级表数/键范围/墓碑数、每步刷盘合并轨迹、输入键数、存活键、写出条目、读写放大、Oracle及实际键值、摘要。空输入和超限在提交时422，引用不存在404，重名409，排队/运行总数超过20时429；worker失败保存error和failed状态。
 
+### 值空间回收演练口径
+
+- 大值阈值1–200单位；值长度超过阈值时存入独立值空间，键表只保存引用。小于等于阈值的值保留在键表内。
+- 值空间上限8–100000单位，**搬迁副本同样计入占用**。写入或搬迁会使占用超过上限时拒绝执行（422），不删除任何仍可读的值。
+- 回收是两阶段搬迁：先把值复制到新址，再切换键引用（重定向生效），最后释放原址。原址只有在切换生效**且**所有固定它的范围读都结束后才释放。
+- 已开始的范围读读到开始时已存在的值；期间覆盖键、删键或搬迁都不改变该次读的快照，结束后其固定才解除。
+- 回收队列游标和每条搬迁日志都保存在演练状态里。中断后从原进度继续，重试不会重复计入已存副本；若暂停期间键被覆盖/删除，恢复时中止该次搬迁，不复活旧值。
+- 每次动作后自动核对：占用等于实际值大小、不超过上限、键表引用可解析、范围读固定的旧地址仍存在、键表读值等于最后写入记录。核对结果在页面展示。
+
+值空间 token 引用的接口为 `GET/POST /value-drills`、`GET /value-drills/{id}`、`POST /value-drills/{id}/actions`；动作 action 取 `put`、`delete`、`range_read`、`finish_read`、`gc_step`、`resume`、`verify`，观察员调用写动作返回403。
+
 ## 技术栈与代码组织
 
 | 服务 | 实现与作用 |
@@ -74,10 +87,10 @@ Seed另含“旧值复活回归集”和“全部删除边界集”；配置另�
 | frontend | 原生HTML/CSS/JS ES模块，Nginx1.27，土橙材料样本册视觉 |
 | backend | Python3.11、FastAPI、SQLAlchemy、PyMySQL、JWT与PBKDF2密码 |
 | worker | 独立Python进程，Redis BLPOP，LSM演算，数据库恢复队列，心跳健康检查 |
-| db | MySQL8.0，持久化3个业务实体、用户与审计 |
+| db | MySQL8.0，持久化4个业务实体（含值空间演练状态）、用户与审计 |
 | redis | Redis7，异步队列与持久卷 |
 
-`backend/src/`分为config/models/schemas/services/controllers/routes/middlewares/utils/constants；`backend/scripts/seed_demo.py`种子与初始化；`backend/migrations/README.md`为schema v1说明。3实体dataset/config/trial各自贯穿model/schema/service/route、前端api/store/page。试验结果保存在Trial JSON字段中，详情页为独立业务页面。
+`backend/src/`分为config/models/schemas/services/controllers/routes/middlewares/utils/constants；`backend/scripts/seed_demo.py`种子与初始化；`backend/migrations/README.md`为schema v2说明。4实体dataset/config/trial/value_drill各自贯穿model/schema/service/route、前端api/store/page。试验结果保存在Trial JSON字段中，详情页为独立业务页面；值空间演练状态保存在ValueDrill JSON字段中，算法在`services/value_space.py`，页面为`pages/values.js`。
 
 `frontend/src/`包含api/stores/types/components/common/hooks/pages/router/utils/constants，表格/状态/页头跨页共享，HTML转义与反馈工具复用。角色/任务状态/操作类型枚举在`backend/src/constants/enums.py`和`frontend/src/constants/enums.js`。模型默认任务状态使用后端枚举，前端状态组件使用前端枚举。
 
@@ -92,6 +105,7 @@ Docker恰好5服务，全部healthcheck；backend依赖db/redis healthy，worker
 - 存储过程为内存教学模型，忽略磁盘块、压缩、Bloom过滤器、WAL持久化、并行compaction与真实故障恢复。MySQL负责保存网页业务输入和输出。
 - 前端创建独立批次/配置，不提供原记录编辑删除；新版本新建记录，试验总是固定输入快照。
 - 最终全历史合并允许去掉墓碑；没有模拟跨副本历史/快照读，因此不能将该规则直接用于生产数据库。
+- 值空间演练也是内存教学模型：无真实磁盘地址、无后台回收线程、无跨进程事务；范围读以显式开始/结束模拟长读，回收由按钮或 API 动作推进。状态整份写入 JSON 字段，多个 worker 并发操作同一演练不属于目标场景（仅用行锁避免同进程请求互相覆盖）。
 - 单worker与按钮刷新；不提供多worker分布式锁、SSE。
 - Web双字体来自Google Fonts，离线回退到serif/monospace。
 
